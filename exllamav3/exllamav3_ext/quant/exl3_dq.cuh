@@ -160,6 +160,28 @@ __device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& fr
     frag1[1] = d6d7;
 }
 
+// Eight consecutive positions per lane in one circular 256-position, 8-bpw tile.
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_8bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    const uint32_t j = (uint32_t) t_offset >> 2;
+    const uint32_t prev = ptr[(j + 63u) & 63u];
+    const uint32_t curr = ptr[j];
+    const uint32_t next = ptr[j + 1u];
+    const uint32_t w0 = ((prev << 8) | (curr >> 24)) & 0xffffu;
+    const uint32_t w1 = curr >> 16;
+    const uint32_t w2 = (curr >> 8) & 0xffffu;
+    const uint32_t w3 = curr & 0xffffu;
+    const uint32_t w4 = ((curr << 8) | (next >> 24)) & 0xffffu;
+    const uint32_t w5 = next >> 16;
+    const uint32_t w6 = (next >> 8) & 0xffffu;
+    const uint32_t w7 = next & 0xffffu;
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
 template <int cb>
 __device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
 {
@@ -324,7 +346,6 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
     }
     else if constexpr (bits == 8)
     {
-        dq4<bits, cb>(ptr, idx, frag0);
-        dq4<bits, cb>(ptr, idx + 4, frag1);
+        dq8_aligned_8bits<cb>(ptr, idx, frag0, frag1);
     }
 }
