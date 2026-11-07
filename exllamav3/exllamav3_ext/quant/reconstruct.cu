@@ -231,7 +231,6 @@ void reconstruct_had_tile
     int n = nb * 8;
     int row_len = gridDim.x * 128;
 
-    __shared__ uint32_t s_packed[8][8][packed_size / 2];
     __shared__ half2 stile[128 * 64];
 
     auto tix = [&] (int R, int q, int p)
@@ -239,23 +238,15 @@ void reconstruct_had_tile
         return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
     };
 
-    constexpr int j_int4 = packed_size / 8;
-    for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
-    {
-        int j = u / (8 * j_int4);
-        int r = u % (8 * j_int4);
-        const uint16_t* gp = g_packed +
-            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
-        ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
-    }
-    __syncthreads();
-
     for (int jj = 0; jj < 8 * 8 / (RH_THREADS / 32); ++jj)
     {
         int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
         int wn = warp_id % 8;
         register FragB frag[2];
-        dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+        const uint16_t* gp = g_packed +
+            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n + wn)) * packed_size;
+        // Packed windows are read-only; decode directly into registers.
+        dq_dispatch<K, cb, HALF>((const uint32_t*) gp, lane_id * 8, frag[0], frag[1]);
 
         half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
         half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
