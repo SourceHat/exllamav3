@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from collections.abc import Mapping
 from ..constants import PAGE_SIZE
 import torch
 from ..util.memory import malloc_trim
@@ -23,8 +24,8 @@ class HostPool:
     lifetimes interleaved with everything else the process allocates; allocating them fresh per stash
     and freeing them on eviction is exactly the pattern that strands memory in glibc's arenas (the
     dynamic mmap threshold moves them into the heap after the first free, and what malloc_trim can
-    then hand back depends on the allocator and the platform). Buffers are handed out by exact shape
-    and dtype, returned on eviction, and never freed, so the pool's footprint is bounded by the peak
+    then hand back depends on the allocator and the platform). Buffers are handed out by exact shape,
+    dtype and pinning, returned on eviction, and never freed, so the pool's footprint is bounded by the peak
     checkpoint occupancy and the allocator sees no churn at all.
     """
 
@@ -33,24 +34,24 @@ class HostPool:
         self.allocated = 0
         self.reused = 0
 
-    def take(self, shape, dtype):
-        key = (tuple(shape), dtype)
+    def take(self, shape, dtype, pin_memory = False):
+        key = (tuple(shape), dtype, pin_memory)
         lst = self.free.get(key)
         if lst:
             self.reused += 1
             return lst.pop()
         self.allocated += 1
-        return torch.empty(shape, dtype = dtype)
+        return torch.empty(shape, dtype = dtype, pin_memory = pin_memory)
 
     def give(self, obj):
         """Return every tensor inside a stashed structure (dict / list / tuple of tensors) to the pool"""
         if isinstance(obj, torch.Tensor):
             if obj.device.type == "cpu":
-                self.free.setdefault((tuple(obj.shape), obj.dtype), []).append(obj)
+                self.free.setdefault((tuple(obj.shape), obj.dtype, obj.is_pinned()), []).append(obj)
         elif isinstance(obj, (list, tuple)):
             for o in obj:
                 self.give(o)
-        elif isinstance(obj, dict):
+        elif isinstance(obj, Mapping):
             for k, o in obj.items():
                 if k not in ("position", "checkpoint_size", "tp_handle"):
                     self.give(o)
@@ -319,7 +320,7 @@ class RecurrentCache(OrderedDict):
         the top level of a bare state stash)"""
         for key in ("target", "draft", None):
             s = stashed if key is None else stashed.get(key)
-            if not isinstance(s, dict) or "tp_handle" not in s:
+            if not isinstance(s, Mapping) or "tp_handle" not in s:
                 continue
             model = self.model if key is None else self.models[key]
             if model is not None and model.loaded_tp:

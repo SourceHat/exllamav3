@@ -7,6 +7,7 @@ allocates fresh memory. Checked against the pool's allocation/reuse counters and
 """
 
 from types import SimpleNamespace
+from collections import UserDict
 
 import pytest
 import torch
@@ -62,6 +63,14 @@ def test_give_walks_a_stashed_structure():
     for _ in range(4):
         assert id(pool.take((3,), torch.float32)) in ids
     assert pool.reused == 4
+
+
+@pytest.mark.nogpu
+def test_give_accepts_nested_mappings():
+    pool = HostPool()
+    tensor = pool.take((3,), torch.float32)
+    pool.give({"target": UserDict({"layer": (tensor,)})})
+    assert pool.take((3,), torch.float32) is tensor
 
 
 def test_give_does_not_pool_device_tensors(device):

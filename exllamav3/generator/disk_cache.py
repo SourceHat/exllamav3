@@ -13,6 +13,7 @@ import threading
 import time
 import zlib
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -860,8 +861,8 @@ class DiskPageCache:
     def _sides(self, stashed: dict):
         """(top-level ints, {side: side dict}) of a stash: a PairedState stash has "target"/"draft" sides, a
         bare dict is one unnamed side"""
-        if any(isinstance(stashed.get(k), dict) for k in ("target", "draft")):
-            sides = {k: stashed[k] for k in ("target", "draft") if isinstance(stashed.get(k), dict)}
+        if any(isinstance(stashed.get(k), Mapping) for k in ("target", "draft")):
+            sides = {k: stashed[k] for k in ("target", "draft") if isinstance(stashed.get(k), Mapping)}
             top = {k: v for k, v in stashed.items() if k not in sides}
             return top, sides
         return {}, {"__root__": stashed}
@@ -922,7 +923,7 @@ class DiskPageCache:
         ranks' writes dispatched here, since neither may happen from the writer thread.
         """
         manifest = {"phash": phash.hex(), "fingerprint": self.fingerprint, "position": top.get("position", 0),
-                    "top": {k: v for k, v in top.items() if not isinstance(v, (dict, list, tuple, torch.Tensor))},
+                    "top": {k: v for k, v in top.items() if not isinstance(v, (Mapping, list, tuple, torch.Tensor))},
                     "sides": {}}
         local_writes = []       # (offset, tensor) for the writer thread
         tp_writes = []          # (model, cache_id, handle, image_offset, layers)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+from collections.abc import MutableMapping
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -39,7 +40,7 @@ from ..cache.recurrent import (
 )
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
-from ..cache.recurrent import host_copy
+from ..cache.recurrent import host_copy, host_pool
 
 
 def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
@@ -111,6 +112,49 @@ def mp_cache_recurrent_unstash_gdn(local_context: dict, cache_id: int, cp_handle
             l.unstash(slot, st, position, parity)
         else:
             l.unstash(slot, st, position)
+
+
+def _checkpoint_copy_stream(cache, device):
+    streams = getattr(cache, "_checkpoint_copy_streams", None)
+    if streams is None:
+        streams = cache._checkpoint_copy_streams = {}
+    stream = streams.get(device)
+    if stream is None:
+        stream = streams[device] = torch.cuda.Stream(device = device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    return stream
+
+
+class _GDNCheckpoint(MutableMapping):
+    def __init__(self, **metadata):
+        self._data = metadata
+        self._pending = {}
+
+    def __getitem__(self, key):
+        event = self._pending.get(key)
+        if event is not None:
+            event.synchronize()
+            del self._pending[key]
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        if key in self._pending:
+            self[key]
+        self._data[key] = value
+
+    def __delitem__(self, key):
+        if key in self._pending:
+            self[key]
+        del self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def copy(self):
+        return dict(self)
 
 
 class GDNState:
@@ -209,15 +253,21 @@ class GDNState:
         # A speculative pass whose outcome was never settled has its committed state in the
         # base row still, but its position already includes the provisional tokens
         assert self.last_history == 0, "GDN stash: state has an unsettled speculative pass (rewind() first)"
-        stashed = {
-            "position": self.position,
-            "checkpoint_size": self.checkpoint_size
-        }
+        metadata = {"position": self.position, "checkpoint_size": self.checkpoint_size}
         if not self.cache.model.loaded_tp:
+            stashed = _GDNCheckpoint(**metadata)
+            streams = {}
             for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position, self.parity) if isinstance(l, GDNLayerState) \
-                    else l.stash(self.slot, self.position)
+                if isinstance(l, GDNLayerState) and l.device is not None and torch.device(l.device).type == "cuda":
+                    device = torch.device(l.device)
+                    if device not in streams:
+                        streams[device] = _checkpoint_copy_stream(self.cache, device)
+                    stashed[k], stashed._pending[k] = l.stash_async(self.slot, self.parity, streams[device])
+                else:
+                    stashed[k] = l.stash(self.slot, self.position, self.parity) if isinstance(l, GDNLayerState) \
+                        else l.stash(self.slot, self.position)
         else:
+            stashed = metadata
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash_gdn,
                                              (id(self.cache), cp_handle, self.slot, self.position, self.parity))
@@ -307,6 +357,7 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        self._checkpoint_read = None
 
 
     def set_state_dtype(self, dtype: torch.dtype):
@@ -344,6 +395,7 @@ class GDNLayerState:
 
 
     def free(self):
+        self._wait_checkpoint_read()
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
         self.spec_conv = torch.empty_like(self.spec_conv, device = "meta")
@@ -351,15 +403,18 @@ class GDNLayerState:
         self.spec_g = torch.empty_like(self.spec_g, device = "meta")
         self.spec_shape = None
         self.device = None
+        self._checkpoint_read = None
 
 
     def clear(self, idx: int):
         if self.device is not None:
+            self._wait_checkpoint_read()
             self.conv_state[idx].zero_()
             self.recurrent_state[2 * idx : 2 * idx + 2].zero_()
 
 
     def get_state_tensors(self):
+        self._wait_checkpoint_read()
         return (
             self.conv_state,
             self.recurrent_state,
@@ -413,6 +468,7 @@ class GDNLayerState:
         computed without performing any copy. Addresses are integer arithmetic on the base
         pointer: a rewind touches every GDN layer of the model, and indexing views cost ~10 us
         per layer in Python."""
+        self._wait_checkpoint_read()
         if last_history == 0:
             return None
         assert 0 <= num_tokens <= last_history, \
@@ -436,6 +492,7 @@ class GDNLayerState:
         over the first `prefix` staged tokens of batch row `spec_row` of the last speculative
         pass, from the pool row `base_row` into `scratch_row`. Same kernel, same inputs, same
         initial state as that pass, so the result is the state it had after `prefix` tokens"""
+        self._wait_checkpoint_read()
         assert self.spec_shape == spec_shape, \
             f"GDN replay: staged inputs are from a pass of shape {self.spec_shape}, rewind expects {spec_shape}"
         bsz, seqlen, tstride = spec_shape
@@ -458,6 +515,31 @@ class GDNLayerState:
         )
 
 
+    def _wait_checkpoint_read(self):
+        event = self._checkpoint_read
+        if event is not None:
+            if event.query():
+                self._checkpoint_read = None
+            else:
+                # Keep the event until complete: more than one stream may mutate the state.
+                torch.cuda.current_stream(self.device).wait_event(event)
+
+
+    def stash_async(self, slot, parity, stream):
+        cdim = self.module.conv_kernel_size
+        row = 2 * slot + parity
+        sources = (self.recurrent_state[row : row + 1], self.conv_state[slot, :, :cdim])
+        host = tuple(host_pool.take(t.shape, t.dtype, pin_memory = True) for t in sources)
+        with torch.cuda.stream(stream):
+            for target, source in zip(host, sources):
+                target.copy_(source, non_blocking = True)
+                source.record_stream(stream)
+            event = torch.cuda.Event()
+            event.record(stream)
+        self._checkpoint_read = event
+        return host, event
+
+
     def stash(self, slot, position: int = 0, parity: int = 0):
         cdim = self.module.conv_kernel_size
         row = 2 * slot + parity
@@ -468,6 +550,7 @@ class GDNLayerState:
 
 
     def unstash(self, slot, stashed, position: int = 0, parity: int = 0):
+        self._wait_checkpoint_read()
         cdim = self.module.conv_kernel_size
         s, c = stashed
         row = 2 * slot + parity

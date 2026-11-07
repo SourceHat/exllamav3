@@ -1,4 +1,5 @@
 import torch
+from collections.abc import Mapping
 import traceback
 import os
 import signal
@@ -783,7 +784,7 @@ def pack_stash(obj, tensors: list) -> object:
         return {"__tuple__": [pack_stash(o, tensors) for o in obj]}
     if isinstance(obj, list):
         return [pack_stash(o, tensors) for o in obj]
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         return {"__dict__": [[pack_stash(k, tensors), pack_stash(v, tensors)] for k, v in obj.items()]}
     return obj
 
