@@ -92,3 +92,17 @@ magnitude. Greedy runs are compared with `assert_greedy_equivalent` (identical u
 
 Model matrices (`@pytest.mark.models(...)`) leave out roles tagged `draft` or `hf_reference` unless a tag names
 them. To add a case to a feature, add a registry model with the right tags, or a row to the file's case table.
+
+## Data movement timings
+
+Use a clean source installation and a separate extension build cache for each checkout:
+
+```sh
+python tests/tools/bench_data_movement.py --source . --device cuda:0 --output timings.json
+```
+
+Run the same script and arguments against the base and patched source. Results retain every repetition and
+report synchronized wall time, including host work, after warmup. These are synthetic operator timings, not
+end-to-end serving throughput. `eval/perf.py` provides model-level prefill/decode measurements.
+GPU-only cases amortize synchronization across ten iterations; host-buffer cases complete each pass before
+reusing their pinned storage. `--iterations-per-sample` changes the GPU-only batch size.
