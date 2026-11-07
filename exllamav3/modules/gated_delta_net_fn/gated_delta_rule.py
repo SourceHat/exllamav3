@@ -95,7 +95,7 @@ def torch_recurrent_kda(q, k, v, g, beta, state):
 _scan_sub_range = int(os.environ.get("EXL3_GDN_SUB_CHUNK", "2048"))
 
 
-def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
+def _chunked_scan(fn, q, k, v, g, beta, state, save_state, pack_qkv = False):
     """
     fn (chunk_gated_delta_rule / chunk_kda) over one batch row in sub-ranges of the sequence.
     q, k: (1, T, H, K); v: (1, T, HV, V); state: (1, HV, K, V) fp32 or None. Returns the
@@ -104,14 +104,22 @@ def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
     """
     T = q.shape[1]
     sub = _scan_sub_range if _scan_sub_range > 0 else T
+    if pack_qkv:
+        from .pack_qkv import pack_qkv_l2norm
     if T <= sub:
+        if pack_qkv:
+            q, k, v = pack_qkv_l2norm(q, k, v)
         return fn(q, k, v, g = g, beta = beta, initial_state = state, output_final_state = save_state,
-                  use_qk_l2norm_in_kernel = True)
+                  use_qk_l2norm_in_kernel = not pack_qkv)
     out = None
     for t0 in range(0, T, sub):
         t1 = min(t0 + sub, T)
-        o, state = fn(q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g = g[:, t0:t1], beta = beta[:, t0:t1],
-                      initial_state = state, output_final_state = True, use_qk_l2norm_in_kernel = True)
+        qi, ki, vi = q[:, t0:t1], k[:, t0:t1], v[:, t0:t1]
+        if pack_qkv:
+            qi, ki, vi = pack_qkv_l2norm(qi, ki, vi)
+        o, state = fn(qi, ki, vi, g = g[:, t0:t1], beta = beta[:, t0:t1],
+                      initial_state = state, output_final_state = True, use_qk_l2norm_in_kernel = not pack_qkv)
+        del qi, ki, vi
         if out is None:
             out = torch.empty((1, T) + o.shape[2:], dtype = o.dtype, device = o.device)
         out[:, t0:t1] = o
@@ -216,19 +224,24 @@ def gated_delta_rule_fn(
         v = v.view(bsz, seqlen, -1, v_head_dim)
 
         # (Grouped attn supported in fla-core now)
+        pack_qkv = (
+            not history and mixed_qkv.is_cuda and mixed_qkv.dtype == torch.bfloat16 and mixed_qkv.is_contiguous()
+            and 0 < k_head_dim <= 512 and 0 < v_head_dim <= 512
+            and k_dim == num_k_heads * k_head_dim and v_dim == num_v_heads * v_head_dim
+        )
         rows_out, rows_in = chunked_rows()
         core_attn_out = []
         for i, (so, si) in enumerate(zip(rows_out, rows_in)):
             state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
-                state, save_state,
+                state, save_state, pack_qkv = pack_qkv,
             )
             if save_state and state is not None:
                 recurrent_state[so, 0].copy_(new_state.squeeze(0))
             core_attn_out.append(core_attn)
 
-        core_attn_out = torch.cat(core_attn_out, dim = 0)
+        core_attn_out = core_attn_out[0] if bsz == 1 else torch.cat(core_attn_out, dim = 0)
 
     # Fused recurrent rule
     else:
