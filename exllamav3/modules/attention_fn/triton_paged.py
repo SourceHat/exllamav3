@@ -355,12 +355,13 @@ def _normalize_window(window_size):
     return int(window_size[0]), int(window_size[1])
 
 
-def _check_tensor(name: str, tensor: torch.Tensor, dtype: torch.dtype | None = torch.float16):
+def _check_tensor(name: str, tensor: torch.Tensor, dtype: torch.dtype | None = torch.float16,
+                  *, require_contiguous: bool = True):
     if not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
     if dtype is not None and tensor.dtype != dtype:
         raise ValueError(f"{name} must have dtype {dtype}")
-    if not tensor.is_contiguous():
+    if require_contiguous and not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
 
 
@@ -1516,6 +1517,8 @@ def _paged_attn_prefill_kernel(
     k_new,
     v_new,
     sinks,
+    q_sb, q_sm: tl.constexpr, q_sh: tl.constexpr, q_sd: tl.constexpr,
+    o_sb, o_sm: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
     num_splits,          # runtime: only enters the split-span arithmetic; IS_SPLIT gates the code
     resume,              # runtime: reload the running state of the earlier kv slices (staging)
     IS_SPLIT: tl.constexpr,   # num_splits > 1: store partials for the combine pass
@@ -1560,14 +1563,15 @@ def _paged_attn_prefill_kernel(
     d_mask = offs_d < head_dim
     valid_row = offs_m < q_len
 
-    # q/out element offsets reach q_len * n_q_heads * head_dim, past int32 at ~64k rows for
-    # 32-head/256-dim geometry: widen the row term. Conditional on the wrapper detecting a
-    # tensor past the boundary, so common geometries keep pure int32 index math
+    # Head views retain the parent pitch; widen before multiplying a large stride.
     if WIDE_INDEX:
-        row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+        b_idx = batch.to(tl.int64)
+        m_idx = offs_m.to(tl.int64)
+        h_idx = q_head.to(tl.int64)
+        d_idx = offs_d.to(tl.int64)
     else:
-        row64 = batch * q_len + offs_m[:, None]
-    q_ptrs = q + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
+        b_idx, m_idx, h_idx, d_idx = batch, offs_m, q_head, offs_d
+    q_ptrs = q + b_idx * q_sb + m_idx[:, None] * q_sm + h_idx * q_sh + d_idx[None, :] * q_sd
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None] & d_mask[None, :], other = 0.0)
     if QCK > 0:
         q_tile = _rot_h32(q_tile, h32, BLOCK_M, HD_PAD)
@@ -1715,7 +1719,7 @@ def _paged_attn_prefill_kernel(
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
             out_tile = _rot_h32(out_tile, h32, BLOCK_M, HD_PAD)
-        out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
+        out_ptrs = out + b_idx * o_sb + m_idx[:, None] * o_sm + h_idx * o_sh + d_idx[None, :] * o_sd
         tl.store(out_ptrs, out_tile, mask = valid_row[:, None] & d_mask[None, :])
 
 
@@ -1726,6 +1730,7 @@ def _paged_attn_prefill_combine_kernel(
     out,
     h32,
     sinks,
+    o_sb, o_sm: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
     num_splits,          # runtime: loop bound
     QCV: tl.constexpr,
     HAS_SINKS: tl.constexpr,
@@ -1778,10 +1783,13 @@ def _paged_attn_prefill_combine_kernel(
     if QCV > 0:
         out_tile = _rot_h32(out_tile, h32, BLOCK_M, HD_PAD)
     if WIDE_INDEX:
-        row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+        b_idx = batch.to(tl.int64)
+        m_idx = offs_m.to(tl.int64)
+        h_idx = q_head.to(tl.int64)
+        d_idx = offs_d.to(tl.int64)
     else:
-        row64 = batch * q_len + offs_m[:, None]
-    out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
+        b_idx, m_idx, h_idx, d_idx = batch, offs_m, q_head, offs_d
+    out_ptrs = out + b_idx * o_sb + m_idx[:, None] * o_sm + h_idx * o_sh + d_idx[None, :] * o_sd
     tl.store(out_ptrs, out_tile, mask = (offs_m[:, None] < q_len) & d_mask[None, :])
 
 
@@ -1859,7 +1867,7 @@ def paged_attn_triton_prefill(
     touching the cache -- kv positions at or above cache_seqlens[b] read from them. The direct
     form also works without a cache at all (k_cache = None), covering plain non-cached
     attention."""
-    _check_tensor("q", q)
+    _check_tensor("q", q, require_contiguous = False)
 
     bsz, q_len, n_q_heads, head_dim = q.shape
     new_kv_mode = 0
@@ -1920,6 +1928,18 @@ def paged_attn_triton_prefill(
 
     if out is None:
         out = torch.empty_like(q)
+    else:
+        _check_tensor("out", out, require_contiguous = False)
+        if out.shape != q.shape or out.device != q.device:
+            raise ValueError("out must have the same shape and device as q")
+        span = 1
+        for stride, size in sorted((s, n) for s, n in zip(out.stride(), out.shape) if n > 1):
+            if stride < span:
+                raise ValueError("out must have non-overlapping strides")
+            span += (size - 1) * stride
+    q_strides, out_strides = q.stride(), out.stride()
+    q_span = 1 + sum((n - 1) * s for n, s in zip(q.shape, q_strides)) if q.numel() else 0
+    out_span = 1 + sum((n - 1) * s for n, s in zip(out.shape, out_strides)) if out.numel() else 0
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -1984,7 +2004,7 @@ def paged_attn_triton_prefill(
     # Sliced staging only reaches SDPA through the fa75 sub-path below: SDPA exposes no lse, so a sliced
     # window cannot merge through it, while fa75 writes the unnormalized (o, m, l) the combine needs
     if (
-        staging_slices is None and
+        staging_slices is None and q.is_contiguous() and out.is_contiguous() and
         qc is None and k_cache is not None and new_kv_mode == 0 and causal and
         _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks)
     ):
@@ -2108,13 +2128,14 @@ def paged_attn_triton_prefill(
         # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
         # fp32 partial buffer); common geometries keep pure int32 codegen
         wide_index = max(
-            bsz * q_len * n_q_heads * head_dim,
-            q_blocks * bsz * n_q_heads * splits * block_m * hd_pad,
+            q_span, out_span,
+            q_blocks * bsz * n_q_heads * splits * block_m * max(hd_pad, 2),
         ) >= 1 << 31
         args = (
             q, kc_, vc_, bt_, cache_seqlens, out,
             partial_o, partial_ml, k_scales, v_scales, h32,
             k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
+            *q_strides, *out_strides,
             splits, resume, is_split, new_kv_mode, qck, qcv,
             q_len, kv_append_len, kv_offset, n_q_heads, n_kv_heads,
             num_pages_, page_size, head_dim, hd_pad, float(softmax_scale),
@@ -2126,7 +2147,7 @@ def paged_attn_triton_prefill(
 
     with torch.cuda.device(q.device):
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
-                    window_right >= 0, has_sinks, stock)
+                    window_right >= 0, has_sinks, stock, q_strides, out_strides)
         def probe(cfg):
             _, args, nw, ns, *_ = prepare(cfg)
             return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
@@ -2143,7 +2164,7 @@ def paged_attn_triton_prefill(
             # combine merges the bounded window through it (SDPA exposes no lse and cannot). fa75
             # has no batch axis: one call per slice and sequence, over that sequence's staged pages
             if (
-                head_dim == 256 and
+                head_dim == 256 and q.is_contiguous() and out.is_contiguous() and
                 _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks) and
                 _fa75_prefill(q.device)
             ):
@@ -2175,6 +2196,7 @@ def paged_attn_triton_prefill(
                                            softmax_scale, offs, bool(p0 > 0))
                 _paged_attn_prefill_combine_kernel[(q_blocks, n_bh)](
                     part_o, part_ml, out, h32, sinks,
+                    *out_strides,
                     1, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, BM,
                     num_warps = 8, num_stages = 1,
                 )
@@ -2205,6 +2227,7 @@ def paged_attn_triton_prefill(
                 _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = num_stages)
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
                 part_o, part_ml, out, h32, sinks,
+                *out_strides,
                 slice_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, block_m,
                 num_warps = 8, num_stages = 1,
             )
@@ -2225,7 +2248,8 @@ def paged_attn_triton_prefill(
                 num_stages = _qc_prefill_ns_env
             else:
                 key = (q.device.index, head_dim, qck, qcv, block_m, block_n, num_warps,
-                       bool(causal), window_left >= 0, window_right >= 0, has_sinks)
+                       bool(causal), window_left >= 0, window_right >= 0, has_sinks,
+                       new_kv_mode, num_splits, wide_index, q_strides, out_strides)
                 num_stages = _qc_prefill_ns_cache.get(key)
                 if num_stages is None:
                     if q_len >= 256:
@@ -2238,6 +2262,7 @@ def paged_attn_triton_prefill(
         if num_splits > 1:
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
                 partial_o, partial_ml, out, h32, sinks,
+                *out_strides,
                 num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, block_m,
                 num_warps=8, num_stages=1,
             )
