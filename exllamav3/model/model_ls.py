@@ -4,6 +4,7 @@ import os
 import torch
 
 from ..modules.attn import prepare_for_attn
+from ..modules.embedding import Embedding
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.memory import (
     set_memory_fraction_reserve,
@@ -472,6 +473,8 @@ class Model_LSMixin(ABC):
         x: torch.Tensor,
         params: dict,
     ):
+        if len(self.fwd_modules) > 1 and isinstance(self.fwd_modules[0][0], Embedding):
+            params["_embedding_output_device"] = self.fwd_modules[1][0].device
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
         for module, instance, idx in self.fwd_modules:
@@ -491,6 +494,8 @@ class Model_LSMixin(ABC):
         x: torch.Tensor,
         params: dict,
     ):
+        if len(self.fwd_modules) > 1 and isinstance(self.fwd_modules[0][0], Embedding):
+            params["_embedding_output_device"] = self.fwd_modules[1][0].device
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
         from ..modules.transformer import TransformerBlock

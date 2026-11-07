@@ -181,6 +181,8 @@ class Embedding(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        output_device = params.pop("_embedding_output_device", None)
+
         # Ensure input IDs in params
         if "input_ids" not in params:
             params["input_ids"] = x
@@ -263,6 +265,16 @@ class Embedding(Module):
                 x = self.embedding.forward(x if x.device == w_dev else x.to(w_dev))
             if self.multiplier != 1.0:
                 x *= self.multiplier
+            if (
+                output_device is not None and torch.device(output_device).type == "cuda" and
+                x.device.type == "cpu" and x.dtype in (torch.half, torch.bfloat16) and
+                out_dtype == torch.float and self.multiplier == 1.0 and not self.normalize
+                and not isinstance(self.embedding, TableEmbedding)
+            ):
+                # Widen on the device so the upload retains the table's 16-bit format.
+                if params.get("pinned_staging"):
+                    x = self._stage_pinned(x)
+                x = x.to(output_device, non_blocking = bool(params.get("pinned_staging")))
             x = to2(x, out_dtype, self.out_dtype)
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
@@ -271,16 +283,19 @@ class Embedding(Module):
             # asynchronous. Only callers that guarantee a sync point between forward passes
             # (the generator's decode loop) may set the pinned_staging flag.
             if params.get("pinned_staging") and x.device.type == "cpu":
-                key = (x.shape, x.dtype)
-                buf = self._pinned_staging.get(key)
-                if buf is None:
-                    if len(self._pinned_staging) > 8:
-                        self._pinned_staging.clear()
-                    buf = torch.empty_like(x, pin_memory = True)
-                    self._pinned_staging[key] = buf
-                buf.copy_(x)
-                x = buf
+                x = self._stage_pinned(x)
             return x
+
+    def _stage_pinned(self, x):
+        key = (x.shape, x.dtype)
+        buf = self._pinned_staging.get(key)
+        if buf is None:
+            if len(self._pinned_staging) > 8:
+                self._pinned_staging.clear()
+            buf = torch.empty_like(x, pin_memory = True)
+            self._pinned_staging[key] = buf
+        buf.copy_(x)
+        return buf
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []
